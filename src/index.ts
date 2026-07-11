@@ -26,6 +26,18 @@ let errTimeout: number = 0
 var initBetStatus: boolean = false;
 let MONEY: string;
 
+// ─── CONFIG ESTRATÉGIA AUTÔNOMA ("Sequência Controlada") ───────────────────────
+// Liga por variáveis de ambiente. Tudo tem default seguro.
+const AUTO_MODE   = String(process.env.AUTO_MODE ?? 'false') === 'true';   // liga o modo autônomo (senão usa Telegram)
+const AUTO_DRY_RUN = String(process.env.AUTO_DRY_RUN ?? 'true') === 'true'; // true = NÃO aposta dinheiro real, só simula/loga
+const AUTO_LIGA   = String(process.env.AUTO_LIGA ?? 'SUPER').toUpperCase(); // COPA | EURO | SUPER | PREMIER
+const AUTO_MAX_GAMES  = Number(process.env.AUTO_MAX_GAMES  ?? 20);   // máx. de jogos por sessão
+const AUTO_MAX_TIROS  = Number(process.env.AUTO_MAX_TIROS  ?? 3);    // teto do martingale (reseta ao atingir)
+const AUTO_STOP_WIN   = Number(process.env.AUTO_STOP_WIN   ?? 5);    // para se o lucro acumulado >= R$
+const AUTO_STOP_LOSS  = Number(process.env.AUTO_STOP_LOSS  ?? 3);    // para se o prejuízo acumulado >= R$
+const AUTO_SETTLE_MS  = Number(process.env.AUTO_SETTLE_MS  ?? 90000);// tempo de espera até o jogo liquidar (ms)
+const AUTO_BASE       = Number(process.env.AUTO_BASE       ?? 0.10); // stake base do tiro 1
+
 
 // ─── TIPOS ───────────────────────────────────────────────────────────────────
 
@@ -327,8 +339,15 @@ let loginReady: boolean = false
 
 const init = async () => {
     await initBet()
-    startQueueWorker() // 🔥 AQUI
-    await watchTelegram()
+
+    if (AUTO_MODE) {
+        // 🤖 Modo autônomo: o próprio bot escolhe os confrontos em sequência
+        await autoSequence()
+    } else {
+        // 📡 Modo padrão: aguarda sinais do Telegram
+        startQueueWorker() // 🔥 AQUI
+        await watchTelegram()
+    }
 }
 
 const initBet = async () => {
@@ -414,8 +433,8 @@ const placeBet = async (props: propsBet, tiro: number = 1) => {
     BetInProgress = true
 
     try {
-        const BASE = 0.10;
-        const valorAposta = BASE * Math.pow(2, tiro - 1); 
+        const BASE = AUTO_BASE;
+        const valorAposta = BASE * Math.pow(2, tiro - 1);
 
         log(`💰 Valor da aposta no tiro ${tiro}: R$${valorAposta}`);
 
@@ -461,6 +480,14 @@ const placeBet = async (props: propsBet, tiro: number = 1) => {
 
             await page.waitForTimeout(1000)
 
+            // 🧪 DRY-RUN (só no modo autônomo): monta a aposta mas NÃO confirma
+            if (AUTO_MODE && AUTO_DRY_RUN) {
+                console.log(`🧪 [DRY-RUN] Aposta montada e NÃO enviada → ${props.liga} ${horario} | tiro ${tiro} | R$${valorAposta.toFixed(2)}`);
+                await page.keyboard.press('Escape').catch(() => {});
+                await page.waitForTimeout(500)
+                continue;
+            }
+
             const btn = page.locator('.bsf-PlaceBetButton');
 
             if (await btn.count() === 0) {
@@ -482,6 +509,131 @@ const placeBet = async (props: propsBet, tiro: number = 1) => {
     } finally {
         BetInProgress = false
     }
+};
+
+
+
+// ─── ESTRATÉGIA AUTÔNOMA: "Sequência Controlada" ───────────────────────────────
+
+// Converte "R$ 1.234,56" → 1234.56
+const parseSaldo = (s: string): number => {
+    if (!s) return NaN;
+    const cleaned = s.replace(/[^\d,.-]/g, '').replace(/\./g, '').replace(',', '.');
+    return parseFloat(cleaned);
+};
+
+// Lê os horários dos próximos confrontos disponíveis na tela, em ordem.
+const lerHorariosDisponiveis = async (liga: string): Promise<string[]> => {
+    try {
+        await page.locator(`.vrl-MeetingsHeader_ButtonContainer >> div >> nth=${indiceChamps[liga]}`).click();
+        await page.waitForTimeout(2500);
+        const horarios: string[] = await page.$$eval(
+            '.vr-EventTimesNavBarButton_Text',
+            (els: any[]) => els.map(e => (e.innerText || '').trim()).filter(Boolean)
+        );
+        // remove duplicados preservando a ordem
+        return [...new Set(horarios)];
+    } catch (err) {
+        console.log('❌ Erro ao ler horários:', err);
+        return [];
+    }
+};
+
+const autoSequence = async () => {
+    console.log('🤖 ===== MODO AUTÔNOMO "Sequência Controlada" =====');
+    console.log(`   Liga: ${AUTO_LIGA} | DRY-RUN: ${AUTO_DRY_RUN} | máx jogos: ${AUTO_MAX_GAMES}`);
+    console.log(`   Martingale até tiro ${AUTO_MAX_TIROS} | base R$${AUTO_BASE.toFixed(2)}`);
+    console.log(`   Stop-win R$${AUTO_STOP_WIN.toFixed(2)} | Stop-loss R$${AUTO_STOP_LOSS.toFixed(2)}`);
+    if (!indiceChamps[AUTO_LIGA]) {
+        console.log(`❌ Liga inválida: ${AUTO_LIGA}. Use COPA | EURO | SUPER | PREMIER.`);
+        return;
+    }
+
+    let tiro = 1;
+    let lucroAcumulado = 0;
+    let jogos = 0;
+    const jaApostados = new Set<string>();
+
+    while (jogos < AUTO_MAX_GAMES) {
+        // trilhos de risco
+        if (lucroAcumulado >= AUTO_STOP_WIN) {
+            console.log(`🏁 STOP-WIN atingido: +R$${lucroAcumulado.toFixed(2)}. Encerrando sessão.`);
+            break;
+        }
+        if (lucroAcumulado <= -AUTO_STOP_LOSS) {
+            console.log(`🛑 STOP-LOSS atingido: R$${lucroAcumulado.toFixed(2)}. Encerrando sessão.`);
+            break;
+        }
+
+        // escolhe o próximo confronto ainda não apostado, em sequência
+        const horarios = await lerHorariosDisponiveis(AUTO_LIGA);
+        const horario = horarios.find(h => !jaApostados.has(h));
+        if (!horario) {
+            console.log('⏳ Nenhum confronto novo disponível. Aguardando próximos...');
+            await sleep(15000);
+            continue;
+        }
+        jaApostados.add(horario);
+        jogos++;
+
+        const [horaStr, minStr] = horario.split(':');
+        const stake = AUTO_BASE * Math.pow(2, tiro - 1);
+
+        console.log(`\n🎯 Jogo ${jogos}/${AUTO_MAX_GAMES} → ${AUTO_LIGA} ${horario} | tiro ${tiro} | stake R$${stake.toFixed(2)}`);
+
+        // saldo antes
+        await getMoney();
+        const saldoAntes = parseSaldo(MONEY);
+
+        // executa (placeBet respeita o DRY-RUN internamente)
+        await placeBet({
+            liga: AUTO_LIGA,
+            hora: horaStr,
+            minutos: [Number(minStr)],
+            entrada: [horario],
+        }, tiro);
+
+        // aguarda o jogo liquidar
+        console.log(`⏱️  Aguardando liquidação (~${Math.round(AUTO_SETTLE_MS / 1000)}s)...`);
+        await sleep(AUTO_SETTLE_MS);
+
+        // determina resultado
+        let green: boolean;
+        if (AUTO_DRY_RUN) {
+            // sem aposta real → simula o resultado só para exercitar a lógica
+            green = getRandomArbitrary(0, 1) > 0.5;
+            console.log(`🧪 [DRY-RUN] resultado SIMULADO: ${green ? 'GREEN' : 'RED'}`);
+        } else {
+            await getMoney();
+            const saldoDepois = parseSaldo(MONEY);
+            const net = saldoDepois - saldoAntes;
+            green = net > 0;
+            lucroAcumulado += net;
+            console.log(`💵 Saldo ${saldoAntes.toFixed(2)} → ${saldoDepois.toFixed(2)} (net ${net >= 0 ? '+' : ''}${net.toFixed(2)}) → ${green ? '🟢 GREEN' : '🔴 RED'}`);
+        }
+
+        // martingale controlado
+        if (green) {
+            if (AUTO_DRY_RUN) lucroAcumulado += stake * 0.8; // estimativa só p/ log em simulação
+            console.log('🟢 GREEN → reset para tiro 1');
+            tiro = 1;
+        } else {
+            if (AUTO_DRY_RUN) lucroAcumulado -= stake;
+            if (tiro >= AUTO_MAX_TIROS) {
+                console.log(`🔴 RED no tiro ${tiro} (teto) → aborta sequência e reseta para tiro 1`);
+                tiro = 1;
+            } else {
+                tiro++;
+                console.log(`🔴 RED → sobe para tiro ${tiro}`);
+            }
+        }
+
+        console.log(`📊 Lucro acumulado: ${lucroAcumulado >= 0 ? '+' : ''}R$${lucroAcumulado.toFixed(2)}`);
+    }
+
+    console.log(`\n🤖 Sessão encerrada. Jogos: ${jogos} | Resultado: ${lucroAcumulado >= 0 ? '+' : ''}R$${lucroAcumulado.toFixed(2)}`);
+    // segura o processo vivo (não fecha o browser abruptamente)
+    await new Promise(() => {});
 };
 
 
