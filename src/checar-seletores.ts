@@ -94,26 +94,27 @@ const run = async () => {
     await clicar('pageItem', bet365Spec.locators.pageItem); await sleep(5000)  // matchday demora a carregar
     await dump('05-liga')
 
-    // 3) Abas de campeonato + horários + odds (fluxo do placeBet)
-    console.log('\n── 3) Campeonato / horários / mercado (placeBet) ──')
-    await checar('abas de liga', '.vrl-MeetingsHeader_ButtonContainer >> div')
-    await clicar(`aba ${LIGA}`, `.vrl-MeetingsHeader_ButtonContainer >> div >> nth=${indiceChamps[LIGA]}`)
-    await sleep(2500); await dump('06-campeonato')
-    await checar('botões de horário', '.vr-EventTimesNavBarButton_Text')
-    await clicar('primeiro horário', '.vr-EventTimesNavBarButton_Text >> nth=0'); await sleep(2500)
+    // 3) Liga (AO VIVO) → horários em "Resultados" (.vrl-HorizontalNavBarScroller_HScroll)
+    console.log('\n── 3) Liga ao vivo / horários / mercado ──')
+    const ligaTab: any = { COPA: 'Copa do Mundo', EURO: 'Euro Cup', SUPER: 'Super Liga Sul-Americana', PREMIER: 'Premier League' };
+    await checar(`aba da liga "${ligaTab[LIGA]}"`, `text=${ligaTab[LIGA]}`)
+    await clicar(`aba ${LIGA}`, `text=${ligaTab[LIGA]}`)
+    await sleep(3000); await dump('06-campeonato')
+    // Timeline de horários/rodadas que carrega abaixo do vídeo (informado pelo usuário)
+    await checar('horários (HScroll Resultados)', '.vrl-HorizontalNavBarScroller_HScroll')
+    await checar('itens de horário', '.vrl-HorizontalNavBarScroller_HScroll >> div')
     await dump('07-mercados')
-    await checar('grupos de mercado', '.gl-MarketGroupPod.gl-MarketGroup')
-    await checar('odds (Over-atual nth=2)', '.gl-MarketGroupPod.gl-MarketGroup >> nth=2 >> .gl-ParticipantOddsOnly')
-    await checar('AMBAS MARCAM (por texto)', 'text=/ambas/i')
-    await checar('cabeçalhos de mercado', '.gl-MarketGroupButton, .cm-MarketGroupWithIconsButton, .gl-MarketGroup_Header')
+    // Mercado "AMBAS MARCAM" = "Para o Time Marcar - Sim/Não" → linha "Ambos os Times" → Sim
+    await checar('grupo "Para o Time Marcar"', 'text=Para o Time Marcar')
+    await checar('linha "Ambos os Times"', 'text=Ambos os Times')
+    await checar('market pods (gl-MarketGroupPod)', '.gl-MarketGroupPod')
+    await checar('odds (gl-ParticipantOddsOnly)', '.gl-ParticipantOddsOnly')
+    await checar('odds centered (gl-ParticipantCentered)', '.gl-ParticipantCentered')
 
-    // 4) Cupom / stake / botão apostar
+    // 4) Cupom / stake / apostar (betslip já validado antes)
     console.log('\n── 4) Cupom de aposta ──')
-    await clicar('clica 1ª odd (abrir cupom)', '.gl-MarketGroupPod.gl-MarketGroup >> nth=2 >> .gl-ParticipantOddsOnly >> nth=0'); await sleep(1500)
-    await dump('08-cupom')
     await checar('caixa de valor (StakeBox)', '.bsf-StakeBox_Wrapper')
     await checar('botão APOSTAR', '.bsf-PlaceBetButton')
-    await checar('recibo (Done)', '.bss-ReceiptContent_Done')
 
     // ── Relatório ──
     const quebrados = resultados.filter(r => !r.achou)

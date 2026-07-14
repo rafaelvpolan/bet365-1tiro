@@ -21,6 +21,22 @@ import {
 import { resolverGrupoDaMensagem } from './signals/telegram';
 import { SIGNAL_GROUPS } from './signals/groups';
 
+// 📝 Tee dos logs para arquivo (bot.log) — permite acompanhar/depurar a execução.
+//    Sobrescreve console.* ANTES de desestruturar log/warn abaixo.
+const _fsLog = require('fs');
+const LOG_FILE = process.env.LOG_FILE || 'bot.log';
+try { _fsLog.writeFileSync(LOG_FILE, `===== início ${new Date().toISOString()} =====\n`); } catch {}
+const _teeFile = (nivel: string, args: any[]) => {
+    try {
+        const linha = args.map(a => (typeof a === 'string' ? a : (() => { try { return JSON.stringify(a); } catch { return String(a); } })())).join(' ');
+        _fsLog.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${nivel} ${linha}\n`);
+    } catch {}
+};
+(['log', 'warn', 'error', 'info'] as const).forEach((m) => {
+    const orig = (console as any)[m].bind(console);
+    (console as any)[m] = (...a: any[]) => { orig(...a); _teeFile(m.toUpperCase(), a); };
+});
+
 const { log, info, warn, error } = console
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -45,7 +61,8 @@ const DRY_RUN = String(process.env.DRY_RUN ?? 'true') === 'true';
 const POLL_MS = Number(process.env.TELEGRAM_POLL_MS ?? 20000);
 // 🎯 MARTINGALE: só tiro 1 e tiro 2. tiro1 = BASE; tiro2 = 2×BASE (dobra se não deu green).
 const MAX_TIROS = Number(process.env.MAX_TIROS ?? 2);
-const BASE_STAKE = Number(process.env.BASE_STAKE ?? process.env.AUTO_BASE ?? 0.10);
+// Valor base do tiro 1 (mínimo da bet365 = R$0,50). Tiro 2 = 2×BASE = R$1,00.
+const BASE_STAKE = Number(process.env.BASE_STAKE ?? 0.50);
 // 🔐 Credenciais bet365 — SEMPRE do .env (nunca hardcoded, senão vazam no git).
 const BET365_USER = String(process.env.BET365_USER ?? '');
 const BET365_PASS = String(process.env.BET365_PASS ?? '');
@@ -88,6 +105,14 @@ const indiceChamps: any = {
     EURO: 2,
     SUPER: 3,
     PREMIER: 4
+}
+
+// Liga do sinal → nome da ABA no "Futebol ao vivo" (clicada por texto).
+const ligaTabLive: any = {
+    COPA: 'Copa do Mundo',
+    EURO: 'Euro Cup',
+    SUPER: 'Super Liga Sul-Americana',
+    PREMIER: 'Premier League',
 }
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
@@ -425,6 +450,23 @@ const init = async () => {
     browserHealthy = true
     attachBrowserWatchdog()    // 🐶 reinicia sozinho se o navegador crashar
 
+    // 🧪 TESTE DE CLIQUE: dispara uma aposta na hora, sem esperar o Telegram.
+    // Ex.:  TEST_SIGNAL="PREMIER 30-33" npm run start:dev
+    // Respeita DRY_RUN (monta e NÃO confirma). Serve pra ver o bot clicar na tela.
+    if (process.env.TEST_SIGNAL) {
+        const raw = process.env.TEST_SIGNAL;
+        // Parsing FLEXÍVEL p/ teste: pega a liga e QUALQUER número (não exige ⏰/TEMPO).
+        const liga = ['EURO', 'COPA', 'PREMIER', 'SUPER'].find(l => raw.toUpperCase().includes(l)) ?? null;
+        const mins = (raw.match(/\d{1,2}/g) ?? []).map(Number).filter(n => n >= 0 && n <= 59).slice(0, MAX_TIROS);
+        log(`🧪 TEST_SIGNAL "${raw}" → liga=${liga} minutos=${JSON.stringify(mins)} (DRY_RUN=${DRY_RUN})`);
+        if (liga && mins.length) {
+            await placeBet({ liga, hora: null, minutos: mins,
+                entrada: [String(mins[0]).padStart(2, '0')] }, 1);
+        } else {
+            warn('🧪 TEST_SIGNAL inválido — use "SUPER 52" ou "PREMIER 30".');
+        }
+    }
+
     if (AUTO_MODE) {
         // 🤖 Modo autônomo: o próprio bot escolhe os confrontos em sequência
         await autoSequence()
@@ -574,6 +616,12 @@ const navigate = async () => {
     await tenta('página do esporte', async () => {
         await page.locator(bet365Spec.locators.pageItem).click({ timeout: 8000 });
     });
+    // 🔄 A página de ligas às vezes não renderiza de primeira — recarrega após 2s.
+    await tenta('reload da página de ligas', async () => {
+        await page.waitForTimeout(2000);
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(2000);
+    });
     return true
 }
 
@@ -621,63 +669,83 @@ const placeBet = async (props: propsBet, tiro: number = 1) => {
 
         if (!loginReady || !initBetStatus) return
 
-        await page.locator(`.vrl-MeetingsHeader_ButtonContainer >> div >> nth=${indiceChamps[props.liga]}`).click();
-        await page.waitForTimeout(2000)
+        // 🔄 Recarrega ANTES de selecionar a liga (a página de ligas às vezes não
+        // renderiza e as odds ao vivo precisam estar atualizadas na hora da aposta).
+        try {
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            await page.waitForTimeout(2500);
+        } catch (e: any) { warn('⚠️ reload pré-aposta falhou:', e?.message?.split('\n')[0] || e); }
+
+        // 1) Seleciona a LIGA pela aba (por texto — futebol ao vivo).
+        const tab = ligaTabLive[props.liga] ?? props.liga;
+        const abaLiga = page.locator(`text=${tab}`);
+        if (await abaLiga.count() === 0) {
+            console.log(`❌ Aba da liga "${tab}" não encontrada`);
+            return;
+        }
+        await abaLiga.first().click();
+        console.log(`✅ Liga: ${tab}`);
+        await page.waitForTimeout(3000)
 
         for (const horario of props.entrada) {
+            // O "minuto" do sinal = minuto do horário do jogo na timeline (ex.: 52 → "01:52").
+            const mm = String(horario.split(':').pop() ?? '').padStart(2, '0');
 
-            const botao = page.locator('.vr-EventTimesNavBarButton_Text', { hasText: horario });
-
+            // 2) Clica no jogo cujo horário termina em :mm.
+            const botao = page.locator('.vr-EventTimesNavBarButton_Text', { hasText: `:${mm}` });
             if (await botao.count() === 0) {
-                console.log(`❌ Horário ${horario} não encontrado`);
+                console.log(`❌ Jogo :${mm} não encontrado na timeline`);
                 continue;
             }
-
             await botao.first().click();
-            console.log(`✅ Clicou em ${horario}`);
+            console.log(`✅ Jogo :${mm} selecionado`);
+            await page.waitForTimeout(2500)
 
-            await page.waitForTimeout(2000)
-
-            const odd = page.locator('.gl-MarketGroupPod.gl-MarketGroup >> nth=2 >> .gl-ParticipantOddsOnly >> nth=0');
-
-            if (await odd.count() === 0) {
-                console.log(`❌ Odd não encontrada`);
+            // 3) Mercado "Para o Time Marcar - Sim/Não" → "Ambos os Times" → coluna SIM.
+            const pod = page.locator('.gl-MarketGroupPod', { hasText: 'Para o Time Marcar' });
+            if (await pod.count() === 0) {
+                console.log('❌ Mercado "Para o Time Marcar" não encontrado');
                 continue;
             }
-
-            await odd.click();
-
+            // Colunas do mercado: [0]=rótulos, [1]=Sim, [2]=Não. "Ambos os Times" é a 1ª linha.
+            let simOdd = pod.first().locator('.gl-Market').nth(1).locator('.gl-ParticipantOddsOnly').first();
+            if (await simOdd.count() === 0) {
+                // grupo pode estar recolhido → abre pelo cabeçalho e tenta de novo.
+                try { await pod.first().locator('.gl-MarketGroupButton').first().click(); await page.waitForTimeout(1000); } catch {}
+                simOdd = pod.first().locator('.gl-Market').nth(1).locator('.gl-ParticipantOddsOnly').first();
+            }
+            if (await simOdd.count() === 0) {
+                console.log('❌ Odd "Ambos os Times → Sim" não encontrada');
+                continue;
+            }
+            const oddTxt = await simOdd.locator('.gl-ParticipantOddsOnly_Odds').first().innerText().catch(() => '?');
+            await simOdd.click();
+            console.log(`✅ "Ambos os Times → Sim" (odd ${oddTxt})`);
             await page.waitForTimeout(1500)
 
+            // 4) Valor da aposta.
             await page.locator('.bsf-StakeBox_Wrapper').click()
-
             await page.keyboard.type(String(valorAposta));
-
             await page.waitForTimeout(1000)
 
-            // 🧪 DRY-RUN: monta a aposta mas NÃO confirma. Ativo por padrão (trava global
-            // DRY_RUN) e também no modo autônomo com AUTO_DRY_RUN. Só confirma com DRY_RUN=false.
+            // 🧪 DRY-RUN: monta e NÃO confirma (trava global DRY_RUN). Só aposta real com DRY_RUN=false.
             if (DRY_RUN || (AUTO_MODE && AUTO_DRY_RUN)) {
-                console.log(`🧪 [DRY-RUN] Aposta montada e NÃO enviada → ${props.liga} ${horario} | tiro ${tiro} | R$${valorAposta.toFixed(2)}`);
+                console.log(`🧪 [DRY-RUN] Montada e NÃO enviada → ${props.liga} :${mm} AMBAS-MARCAM-Sim | tiro ${tiro} | R$${valorAposta.toFixed(2)}`);
                 await page.keyboard.press('Escape').catch(() => {});
                 await page.waitForTimeout(500)
                 continue;
             }
 
             const btn = page.locator('.bsf-PlaceBetButton');
-
             if (await btn.count() === 0) {
                 console.log(`❌ Botão apostar não encontrado`);
                 continue;
             }
-
             await btn.click();
-
             await page.waitForTimeout(3000)
-
-            await page.locator('.bss-ReceiptContent_Done').click()
-
+            try { await page.locator('.bss-ReceiptContent_Done').click({ timeout: 5000 }); } catch {}
             await page.waitForTimeout(1500)
+            console.log(`✅ APOSTA CONFIRMADA → ${props.liga} :${mm} AMBAS-MARCAM-Sim | tiro ${tiro} | R$${valorAposta.toFixed(2)}`);
         }
 
     } catch (err) {

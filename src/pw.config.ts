@@ -2,6 +2,7 @@ import * as fs from 'fs'
 
 const args = [
   '-wait-for-browser',
+  '--mute-audio',            // 🔇 silencia o player do jogo (e qualquer áudio da página)
   '--disable-infobars',
   '--no-sandbox',
   '--start-maximized',
