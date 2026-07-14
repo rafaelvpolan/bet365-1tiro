@@ -5,7 +5,10 @@
   "scripts": {
     "start": "npm i && pm2 delete all && npm run build && pm2 start build/index.js",
     "start:dev": "nodemon",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "coletor": "ts-node src/coletor.ts",
+    "testar": "ts-node src/testar-canais.ts",
+    "checar": "ts-node src/checar-seletores.ts",
+    "test": "ts-node src/testes-sinal.ts",
     "build": "rimraf ./build && tsc"
   },
   "author": "",

@@ -14,6 +14,12 @@ const apiHash: string = String(process.env.TELEGRAM_API_HASH);
 console.log(apiId, typeof apiId);
 
 import { IBets } from './api/bet365/models/bets.model';
+import {
+    propsBet, parseMensagem, isSignal,
+    isResultado, RE_GREEN, RE_RED, extrairReferencia, extrairMinutosMencionados,
+} from './signals/parser';
+import { resolverGrupoDaMensagem } from './signals/telegram';
+import { SIGNAL_GROUPS } from './signals/groups';
 
 const { log, info, warn, error } = console
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -25,11 +31,24 @@ let lastTime: any = null
 let errTimeout: number = 0
 var initBetStatus: boolean = false;
 let MONEY: string;
+let browserHealthy = false;   // navegador vivo e navegável?
+let restarting = false;       // reinício em andamento (evita reinícios paralelos)
 
 // ─── CONFIG ESTRATÉGIA AUTÔNOMA ("Sequência Controlada") ───────────────────────
 // Liga por variáveis de ambiente. Tudo tem default seguro.
 const AUTO_MODE   = String(process.env.AUTO_MODE ?? 'false') === 'true';   // liga o modo autônomo (senão usa Telegram)
 const AUTO_DRY_RUN = String(process.env.AUTO_DRY_RUN ?? 'true') === 'true'; // true = NÃO aposta dinheiro real, só simula/loga
+// 🛡️ Trava GLOBAL de segurança: por padrão NUNCA confirma aposta real (vale p/ Telegram também).
+// Só aposta de verdade com DRY_RUN=false explícito no .env.
+const DRY_RUN = String(process.env.DRY_RUN ?? 'true') === 'true';
+// Intervalo de POLLING dos canais (eventos ao vivo não entregam msgs de canal grande).
+const POLL_MS = Number(process.env.TELEGRAM_POLL_MS ?? 20000);
+// 🎯 MARTINGALE: só tiro 1 e tiro 2. tiro1 = BASE; tiro2 = 2×BASE (dobra se não deu green).
+const MAX_TIROS = Number(process.env.MAX_TIROS ?? 2);
+const BASE_STAKE = Number(process.env.BASE_STAKE ?? process.env.AUTO_BASE ?? 0.10);
+// 🔐 Credenciais bet365 — SEMPRE do .env (nunca hardcoded, senão vazam no git).
+const BET365_USER = String(process.env.BET365_USER ?? '');
+const BET365_PASS = String(process.env.BET365_PASS ?? '');
 const AUTO_LIGA   = String(process.env.AUTO_LIGA ?? 'SUPER').toUpperCase(); // COPA | EURO | SUPER | PREMIER
 const AUTO_MAX_GAMES  = Number(process.env.AUTO_MAX_GAMES  ?? 20);   // máx. de jogos por sessão
 const AUTO_MAX_TIROS  = Number(process.env.AUTO_MAX_TIROS  ?? 3);    // teto do martingale (reseta ao atingir)
@@ -40,13 +59,6 @@ const AUTO_BASE       = Number(process.env.AUTO_BASE       ?? 0.10); // stake ba
 
 
 // ─── TIPOS ───────────────────────────────────────────────────────────────────
-
-interface propsBet {
-    liga: string | null
-    hora: string | null
-    minutos: Array<number>
-    entrada: Array<string>
-}
 
 interface SignalState {
     props: propsBet
@@ -70,7 +82,6 @@ const betQueue: BetQueueItem[] = [];
 
 const activeSignals = new Map<number, SignalState>();
 let BetInProgress = false;
-const groupIds = ["-1003972273645","-1003888617976"];
 
 const indiceChamps: any = {
     COPA: 1,
@@ -128,7 +139,6 @@ const startQueueWorker = () => {
                 const now = Date.now(); // 🔥 corrigido
                 const item = betQueue[i];
                 if (item.timestampExecucao > now) break;
-7
                 // if (BetInProgress) break; // 🔥 corrigido
 
                 const signal = activeSignals.get(item.messageId);
@@ -177,26 +187,40 @@ const startQueueWorker = () => {
 
 // ─── PARSER DE MENSAGEM ───────────────────────────────────────────────────────
 
-const LIGAS = ['EURO', 'COPA', 'PREMIER', 'SUPER'];
+// Casa um resultado "solto" (GREEN/RED sem reply) com um sinal ativo. Nestes grupos
+// o GREEN é uma msg NOVA citando a liga + a faixa de minutos (ex.: "PREMIER ⏰ 39-42").
+// Estratégia: liga obrigatória (se ambos têm), hora se citada, e prioriza o sinal
+// cujos minutos batem com os mencionados; empate → o mais recente.
+function acharSinalPorConteudo(texto: string): number | null {
+    const { liga, hora } = extrairReferencia(texto);
+    const mins = extrairMinutosMencionados(texto);
+    let melhor: number | null = null;
+    let melhorScore = -Infinity;
+    for (const [id, s] of activeSignals.entries()) {
+        if (s.green) continue;
+        if (liga && s.props.liga && s.props.liga !== liga) continue;         // liga não bate
+        if (hora && s.props.hora && String(s.props.hora) !== String(hora)) continue; // hora não bate
+        const overlap = s.props.minutos.some(m => mins.includes(m)) ? 1 : 0;
+        const score = overlap * 1e13 + s.timestamp;                          // overlap manda; depois recência
+        if (score > melhorScore) { melhorScore = score; melhor = id; }
+    }
+    return melhor;
+}
 
-function parseMensagem(texto: string): propsBet {
-    // Liga
-    const liga = LIGAS.find(l => texto.includes(l)) || null;
-
-    // Hora
-    const horaMatch = texto.match(/⏰\s*H:\s*(\d+)/);
-    const hora = horaMatch ? horaMatch[1] : null;
-
-    // Todos os minutos após ➡ (aceita ➡ e ➡️)
-    const setaMatch = texto.match(/➡️?\s*([\d\s]+)/);
-    const minutos = setaMatch
-        ? setaMatch[1].trim().split(/\s+/).map(Number).filter(n => !isNaN(n))
-        : [];
-
-    // Entrada: todos os minutos formatados como "hora:minuto" (usado como fallback)
-    const entrada = minutos.map(min => `${hora}:${String(min).padStart(2, '0')}`);
-
-    return { liga, hora, minutos, entrada };
+// Resolve um sinal. GREEN → cancela os tiros restantes. RED → apenas loga:
+// o próximo minuto (gale) da própria mensagem já está agendado e dispara sozinho.
+function resolverSinal(messageId: number, green: boolean, origem: string): void {
+    const signal = activeSignals.get(messageId);
+    if (!signal) return;
+    if (green) {
+        console.log(`✅ GREEN (${origem}) → cancelando tiros restantes do sinal ${messageId}`);
+        signal.green = true;
+        activeSignals.set(messageId, signal);
+        removeFromQueue(messageId);
+        activeSignals.delete(messageId);
+    } else {
+        console.log(`🔴 RED (${origem}) no sinal ${messageId} → mantém a fila; o próximo minuto (gale) dispara sozinho`);
+    }
 }
 
 // ─── WATCH TELEGRAM ───────────────────────────────────────────────────────────
@@ -227,25 +251,46 @@ const watchTelegram = async () => {
 
     log("📡 Status conectado:", client.connected);
 
-    // ── Nova mensagem ────────────────────────────────────────────────────────
-    client.addEventHandler(async (event: NewMessageEvent) => {
-        const message = event.message;
-        const chatId = message.chatId?.toString();
-        log('CHAT ID::', chatId);
-        if (!chatId || !groupIds.includes(chatId)) return;
-       
+    // ── Processa UMA mensagem (usado pelo evento ao vivo E pelo polling) ─────────
+    const processarMensagem = async (message: any) => {
+        // Resolve o grupo por chatId OU pela origem do encaminhamento (fwdFrom).
+        const grupo = await resolverGrupoDaMensagem(message);
+        if (!grupo) return; // não é um dos grupos monitorados
 
-        log("📩 Nova mensagem:", message.text);
+        const texto = message.rawText ?? message.text ?? "";
 
-        const msg: propsBet = parseMensagem(message.text);
-        log("Estrutura parseada:", msg);
-
-        if (!msg.liga || !msg.hora || msg.minutos.length === 0) {
-            log("⚠️ Mensagem ignorada: sem liga, hora ou minutos.");
+        // 1) É uma confirmação de resultado (GREEN/RED)? → resolve o sinal alvo.
+        const resultado = isResultado(texto);
+        if (resultado) {
+            const replyId = Number((message.replyTo as any)?.replyToMsgId) || 0;
+            const alvo = (replyId && activeSignals.has(replyId))
+                ? replyId
+                : acharSinalPorConteudo(texto);
+            if (alvo && activeSignals.has(alvo)) {
+                const origem = replyId === alvo ? 'reply' : 'conteúdo';
+                if (resultado.green)    resolverSinal(alvo, true,  origem);
+                else if (resultado.red) resolverSinal(alvo, false, origem);
+            } else {
+                log('ℹ️ Resultado sem sinal ativo correspondente — ignorado.');
+            }
             return;
         }
 
+        // 2) É um sinal de entrada?
+        if (!isSignal(texto)) {
+            log('⚠️ Mensagem ignorada: não é sinal nem resultado.');
+            return;
+        }
+
+        const msg: propsBet = parseMensagem(texto);
         const messageId = Number(message.id);
+
+        // 🎯 MARTINGALE: usa no MÁXIMO os 2 primeiros minutos (tiro 1 e tiro 2).
+        const minutosTiros = msg.minutos.slice(0, MAX_TIROS);
+        const planoStakes = minutosTiros.map((_, i) => (BASE_STAKE * Math.pow(2, i)).toFixed(2));
+        log(`🎯 ENTRADA [${grupo}] msg#${messageId}: liga=${msg.liga}${msg.hora ? ` H:${msg.hora}` : ''} | ` +
+            `gale (máx ${MAX_TIROS}): ${minutosTiros.map((m, i) => `T${i + 1}@${m}=R$${planoStakes[i]}`).join(' → ')}` +
+            (msg.minutos.length > MAX_TIROS ? ` (ignorando extras: ${JSON.stringify(msg.minutos.slice(MAX_TIROS))})` : ''));
 
         // ✅ FORA do forEach — registra o sinal UMA VEZ
         activeSignals.set(messageId, {
@@ -256,9 +301,9 @@ const watchTelegram = async () => {
         });
 
 
-        const minutoBase = msg.minutos[0];
+        const minutoBase = minutosTiros[0];
 
-        msg.minutos.forEach((minuto, index) => {
+        minutosTiros.forEach((minuto, index) => {
             const tiro = index + 1;
 
             let deltaMinutos = minuto - minutoBase;
@@ -290,31 +335,68 @@ const watchTelegram = async () => {
                 timestampExecucao
             });
         });
+    };
 
+    // Handler ao vivo (mantido; mas canais grandes NÃO disparam evento de msg → polling abaixo).
+    client.addEventHandler((event: NewMessageEvent) => {
+        processarMensagem(event.message).catch(e => warn('erro msg ao vivo:', e?.message || e));
     }, new NewMessage({}));
+
+    // 🔑 Prime dos diálogos (carrega entidades p/ getMessages funcionar).
+    try { await client.getDialogs({ limit: 200 }); } catch (e: any) { warn('getDialogs:', e?.message || e); }
+
+    // ── POLLING dos canais ───────────────────────────────────────────────────
+    // É o que REALMENTE pega as entradas: canais grandes mandam UpdateChannelTooLong,
+    // então o evento ao vivo não entrega a mensagem. Buscamos getMessages a cada POLL_MS.
+    const vistos = new Set<string>();
+    let primeiraVarredura = true;
+    const poll = async () => {
+        for (const [nome, id] of Object.entries(SIGNAL_GROUPS)) {
+            try {
+                let alvo: any = id;
+                try { alvo = await client.getEntity(id); } catch {}
+                const msgs: any[] = await client.getMessages(alvo, { limit: 15 });
+                for (const m of [...(msgs ?? [])].reverse()) {
+                    const chave = `${id}:${m.id}`;
+                    if (vistos.has(chave)) continue;
+                    vistos.add(chave);
+                    if (primeiraVarredura) continue; // não aposta em histórico velho na largada
+                    await processarMensagem(m);
+                }
+            } catch (e: any) { warn(`poll ${nome}:`, e?.message?.split('\n')[0] || e); }
+        }
+        if (primeiraVarredura) { log(`👀 Polling ativo (a cada ${Math.round(POLL_MS / 1000)}s). ${vistos.size} msgs marcadas como base.`); }
+        primeiraVarredura = false;
+    };
+    await poll();
+    setInterval(() => { poll().catch(e => warn('poll loop:', e?.message || e)); }, POLL_MS);
 
     // ── Mensagem editada — detecta GREEN ─────────────────────────────────────
     client.addEventHandler(async (event: EditedMessageEvent) => {
         const message = event.message;
-        const chatId = message.chatId?.toString();
-      
-        if (!chatId || !groupIds.includes(chatId)) return;
-
-        const signal = activeSignals.get(message.id);
-        if (!signal) return; // Não é um sinal ativo
+        if (!await resolverGrupoDaMensagem(message)) return;
 
         const text = message.text ?? "";
-        log(`✏️  Mensagem editada (ID: ${message.id}):`, text);
 
-        if (text.toUpperCase().includes("GREEN")) {
-            console.log(`✅ GREEN detectado! Cancelando sinal ${message.id}`);
+        // A edição pode ser na própria msg do sinal, numa msg que responde o sinal,
+        // ou numa msg de resultado que cita liga/hora.
+        const replyId = Number((message.replyTo as any)?.replyToMsgId) || 0;
+        const alvo = activeSignals.has(message.id)
+            ? message.id
+            : (replyId && activeSignals.has(replyId))
+                ? replyId
+                : acharSinalPorConteudo(text);
 
-            signal.green = true;
-            activeSignals.set(message.id, signal);
+        if (!alvo || !activeSignals.has(alvo)) return;
 
-            removeFromQueue(message.id);
-            activeSignals.delete(message.id);
-        }
+        log(`✏️  [edit] (msg ${message.id} → sinal ${alvo}):`, text);
+
+        // Na própria msg do sinal, isResultado() retorna null (ainda parseia como sinal);
+        // por isso testamos GREEN/RED diretamente como fallback.
+        const green = RE_GREEN.test(text);
+        const red   = RE_RED.test(text);
+        if (green)    resolverSinal(alvo, true,  'edição');
+        else if (red) resolverSinal(alvo, false, 'edição');
 
     }, new EditedMessage({}));
 
@@ -338,7 +420,10 @@ const watchTelegram = async () => {
 let loginReady: boolean = false
 
 const init = async () => {
+    installGlobalGuards()      // 🛡️ evita que 1 rejeição não tratada derrube o processo
     await initBet()
+    browserHealthy = true
+    attachBrowserWatchdog()    // 🐶 reinicia sozinho se o navegador crashar
 
     if (AUTO_MODE) {
         // 🤖 Modo autônomo: o próprio bot escolhe os confrontos em sequência
@@ -358,53 +443,137 @@ const initBet = async () => {
     await getMoney()
 }
 
+// ─── WATCHDOG DE CRASH DO NAVEGADOR ────────────────────────────────────────────
+// Detecta crash/fechamento do Chromium e reinicia sozinho, sem derrubar o bot
+// (o Telegram continua escutando — só a camada de aposta é reconstruída).
+
+const browserErrRe = /(Target (?:closed|crashed)|browser(?: has been)? closed|Session closed|Connection closed|Execution context was destroyed|frame (?:was |got )?detached|Protocol error|has been closed|crashed)/i;
+const pareceErroDeBrowser = (m: any): boolean => browserErrRe.test(String(m?.message ?? m ?? ''));
+
+const attachBrowserWatchdog = (): void => {
+    try {
+        page.on('crash', () => { warn('💥 Página (page) crashou'); browserHealthy = false; scheduleRestart('page crash'); });
+        page.on('close', () => { warn('⚠️ Página (page) fechou'); browserHealthy = false; });
+        context.on('close', () => { warn('⚠️ Context fechou'); browserHealthy = false; scheduleRestart('context close'); });
+        const browser = typeof context.browser === 'function' ? context.browser() : null;
+        browser?.on?.('disconnected', () => { warn('⚠️ Browser desconectou'); browserHealthy = false; scheduleRestart('browser disconnected'); });
+        log('🐶 Watchdog do navegador ativo.');
+    } catch (e: any) {
+        warn('⚠️ Falha ao anexar watchdog:', e?.message || e);
+    }
+};
+
+const scheduleRestart = (motivo: string): void => {
+    if (restarting) return;               // já tem um reinício em andamento
+    restarting = true;
+    warn(`🔄 Agendando reinício do navegador (motivo: ${motivo})...`);
+    restartBrowser().finally(() => { restarting = false; });
+};
+
+const restartBrowser = async (): Promise<void> => {
+    for (let tentativa = 1; tentativa <= 5; tentativa++) {
+        try {
+            warn(`🔁 Reiniciando navegador (tentativa ${tentativa}/5)...`);
+            try { await context?.close(); } catch {}   // fecha o contexto morto (evita vazamento)
+            page = null;
+            context = null;
+            await initBet();                            // relança login + navega + lê saldo
+            attachBrowserWatchdog();
+            browserHealthy = true;
+            log('✅ Navegador reiniciado com sucesso.');
+            return;
+        } catch (e: any) {
+            warn(`❌ Falha ao reiniciar (tentativa ${tentativa}/5):`, e?.message?.split('\n')[0] || e);
+            await sleep(5000 * tentativa);              // backoff progressivo
+        }
+    }
+    warn('🛑 Não reiniciou após 5 tentativas. Nova tentativa em 30s.');
+    setTimeout(() => { restarting = false; scheduleRestart('retry-tardio'); }, 30000);
+};
+
+const installGlobalGuards = (): void => {
+    process.on('unhandledRejection', (reason: any) => {
+        warn('🚨 unhandledRejection:', reason?.message || reason);
+        if (pareceErroDeBrowser(reason)) scheduleRestart('unhandledRejection');
+    });
+    process.on('uncaughtException', (err: any) => {
+        warn('🚨 uncaughtException:', err?.message || err);
+        if (pareceErroDeBrowser(err)) scheduleRestart('uncaughtException');
+    });
+    log('🛡️ Guards globais instalados (o processo não cai mais por rejeição não tratada).');
+};
+
 const login = async () => {
-    browser = await chromium.launch(options)
-    context = await browser.newContext({
+    const os = require('os');
+    const pathMod = require('path');
+    // Perfil dedicado → evita o singleton do Chrome do sistema (pw.config aponta pro Chrome instalado).
+    const userDataDir = pathMod.join(process.env.TEMP || os.tmpdir(), `bet365-1tiro-${Date.now()}`);
+    context = await chromium.launchPersistentContext(userDataDir, {
+        ...options,
         geolocation: { latitude: -23.5505, longitude: -46.6333 },
         permissions: ['geolocation'],
         locale: 'pt-BR',
         timezoneId: 'America/Sao_Paulo',
     });
-    await context.setDefaultTimeout(0);
-    await context.setDefaultNavigationTimeout(0);
-    page = await context.newPage();
-    await page.goto(bet365Spec.url);
+    // Timeouts FINITOS: se um seletor sumir, falha rápido em vez de travar pra sempre.
+    context.setDefaultTimeout(30000);
+    context.setDefaultNavigationTimeout(45000);
+    page = context.pages().length ? context.pages()[0] : await context.newPage();
     await page.setViewportSize({ width: 1620, height: 880 });
-    await page.waitForSelector('body')
-    await page.locator(bet365Spec.loginElements.buttonLogin).click()
-    await page.locator(bet365Spec.loginElements.inputLogin).click();
-    await page.keyboard.type('rafaelvpolan75362')
-    await page.waitForTimeout(800);
-    await page.locator(bet365Spec.loginElements.inputPass).click();
-    await page.keyboard.type('rafa5841');
-    await page.waitForTimeout(1000);
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(5000);
+    try {
+        await page.goto(bet365Spec.url, { waitUntil: 'domcontentloaded' });
+    } catch (e: any) { console.log('⚠️ goto falhou/timeout:', e?.message?.split('\n')[0] || e); }
+    await page.waitForTimeout(4000);
+
+    // aceita cookies se aparecer
+    try {
+        const c = page.locator('button', { hasText: 'Aceitar todos' });
+        if (await c.count() > 0) { await c.click({ timeout: 5000 }); console.log('✅ Cookies aceitos'); }
+    } catch {}
+
+    // login best-effort: se o seletor mudou, NÃO trava — segue em modo leitura (dry-run não aposta real).
+    try {
+        await page.locator(bet365Spec.loginElements.buttonLogin).click({ timeout: 8000 })
+        await page.locator(bet365Spec.loginElements.inputLogin).click({ timeout: 8000 });
+        await page.keyboard.type(BET365_USER)
+        await page.waitForTimeout(800);
+        await page.locator(bet365Spec.loginElements.inputPass).click({ timeout: 8000 });
+        await page.keyboard.type(BET365_PASS);
+        await page.waitForTimeout(1000);
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(5000);
+        console.log('🔑 Login enviado');
+    } catch (e: any) {
+        console.log('⚠️ Login best-effort falhou (segue mesmo assim p/ dry-run):', e?.message?.split('\n')[0] || e);
+    }
     return true
 }
 
 
 
 const navigate = async () => {
-    const popupSaldo = await page.locator(bet365Spec.popups.saldo);
-    if (popupSaldo)
-        await popupSaldo.click();
-    await page.waitForTimeout(2000)
-    const btnPage = await page.locator(bet365Spec.locators.menuCategory);
-    if (btnPage)
-        await btnPage.click();
-    await page.waitForTimeout(2000)
+    // cada passo é best-effort com timeout curto: se um seletor sumiu, não trava a sessão.
+    const tenta = async (label: string, fn: () => Promise<any>) => {
+        try { await fn(); console.log(`✅ ${label}`); }
+        catch (e: any) { console.log(`⚠️ ${label} falhou:`, e?.message?.split('\n')[0] || e); }
+    };
 
-    const cookieButton = page.locator('button', { hasText: "Aceitar todos" });
-    if (await cookieButton.count() > 0) {
-        await cookieButton.click();
-        console.log('✅ Cookies aceitos');
-    }
-
-    const btnPageSport = await page.locator(bet365Spec.locators.pageItem);
-    if (btnPageSport)
-        await btnPageSport.click();
+    await tenta('popup saldo', async () => {
+        const el = page.locator(bet365Spec.popups.saldo);
+        if (await el.count() > 0) await el.click({ timeout: 6000 });
+    });
+    await page.waitForTimeout(1500)
+    await tenta('menu Esportes Virtuais', async () => {
+        await page.locator(bet365Spec.locators.menuCategory).click({ timeout: 8000 });
+    });
+    await page.waitForTimeout(1500)
+    await tenta('cookies', async () => {
+        const cookieButton = page.locator('button', { hasText: "Aceitar todos" });
+        if (await cookieButton.count() > 0) await cookieButton.click({ timeout: 5000 });
+    });
+    await tenta('página do esporte', async () => {
+        await page.locator(bet365Spec.locators.pageItem).click({ timeout: 8000 });
+    });
     return true
 }
 
@@ -433,15 +602,21 @@ const placeBet = async (props: propsBet, tiro: number = 1) => {
     BetInProgress = true
 
     try {
-        const BASE = AUTO_BASE;
-        const valorAposta = BASE * Math.pow(2, tiro - 1);
+        // 🛡️ Garante navegador vivo antes de qualquer interação com a página.
+        if (!page || (typeof page.isClosed === 'function' && page.isClosed()) || !browserHealthy) {
+            warn('⚠️ Navegador indisponível no placeBet → reiniciando antes de apostar.');
+            await restartBrowser();
+            if (!browserHealthy) { warn('🛑 Aposta abortada: navegador não voltou.'); return; }
+        }
 
-        log(`💰 Valor da aposta no tiro ${tiro}: R$${valorAposta}`);
+        // Martingale: tiro 1 = BASE, tiro 2 = 2×BASE. (só tiro 1 e 2)
+        const valorAposta = BASE_STAKE * Math.pow(2, tiro - 1);
+
+        log(`💰 Tiro ${tiro} → R$${valorAposta.toFixed(2)} ${tiro === 1 ? '(base)' : '(dobro — tiro 1 não deu green)'}`);
 
         if (!await getMoney()) {
-            await page.close()
-            loginReady = await login()
-            initBetStatus = await navigate()
+            warn('⚠️ Saldo não lido → reiniciando navegador (fecha o contexto antigo, sem vazar).');
+            await restartBrowser();
         }
 
         if (!loginReady || !initBetStatus) return
@@ -480,8 +655,9 @@ const placeBet = async (props: propsBet, tiro: number = 1) => {
 
             await page.waitForTimeout(1000)
 
-            // 🧪 DRY-RUN (só no modo autônomo): monta a aposta mas NÃO confirma
-            if (AUTO_MODE && AUTO_DRY_RUN) {
+            // 🧪 DRY-RUN: monta a aposta mas NÃO confirma. Ativo por padrão (trava global
+            // DRY_RUN) e também no modo autônomo com AUTO_DRY_RUN. Só confirma com DRY_RUN=false.
+            if (DRY_RUN || (AUTO_MODE && AUTO_DRY_RUN)) {
                 console.log(`🧪 [DRY-RUN] Aposta montada e NÃO enviada → ${props.liga} ${horario} | tiro ${tiro} | R$${valorAposta.toFixed(2)}`);
                 await page.keyboard.press('Escape').catch(() => {});
                 await page.waitForTimeout(500)
